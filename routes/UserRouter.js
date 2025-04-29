@@ -234,6 +234,11 @@ router.put("/updatingProfile", upload.single("dp"), async (req, res) => {
 
 
 
+router.post("/api/user/getUserDetails", async (req, res) => {
+  const { userId } = req.body;
+  const user = await NewUserModel.findById(userId);
+  res.json(user);
+});
 
 
 
@@ -315,34 +320,270 @@ router.post("/resetPassword", async (req, res) => {
 });
 
 
-const verifyToken = (req, res, next) => {
-  const token = req.header("Authorization")?.split(" ")[1];
-  if (!token) return res.status(403).send("Access denied");
+// ------------------------CONNECTIONS STARTS FROM HERE ---------------------------//
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).send("Invalid token");
-    req.user = user;
-    next();
-  });
-};
 
-// Endpoint to fetch users based on state
-router.get("/users", verifyToken, async (req, res) => {
-  const { state } = req.query;
 
-  if (!state) {
-    return res.status(400).json({ status: "failed", msg: "State is required" });
-  }
-
+router.post("/userSuggestions", upload.none(), async (req, res) => {
   try {
-    // Fetch users from the same state
-    const users = await NewUserModel.find({ "location.state": state }).select(
-      "-password"
-    ); // Exclude password field
-    res.json(users);
+    const { userLocation, userId } = req.body;
+
+    if (!userLocation || !userId) {
+      return res
+        .status(400)
+        .json({ message: "userLocation and userId are required" });
+    }
+
+    // Find users in same location and not yourself
+    let allUsers = await NewUserModel.find({
+      "location.state": userLocation,
+      _id: { $ne: userId },
+    });
+
+    // Get user's connections
+    const connections = await ConnectionRequestModel.find({
+      $or: [
+        { senderId: userId, status: "Accepted" },
+        { receiverId: userId, status: "Accepted" },
+      ],
+    });
+
+    const connectedUserIds = connections.map((conn) =>
+      conn.senderId.toString() === userId
+        ? conn.receiverId.toString()
+        : conn.senderId.toString()
+    );
+
+    // Get user's pending sent requests
+    const sentRequests = await ConnectionRequestModel.find({
+      senderId: userId,
+      status: "Pending",
+    });
+
+    const sentUserIds = sentRequests.map((req) => req.receiverId.toString());
+
+    // Now filter
+    const finalSuggestions = allUsers.filter(
+      (user) =>
+        !connectedUserIds.includes(user._id.toString()) &&
+        !sentUserIds.includes(user._id.toString())
+    );
+
+    res.status(200).json(finalSuggestions);
   } catch (error) {
-    res.status(500).json({ status: "failed", msg: "Failed to fetch users" });
+    console.error("Error in userSuggestions:", error);
+    res.status(500).json({ message: "Internal Server Error" });
   }
 });
+
+
+
+
+// Connection Request Schema
+const connectionRequestSchema = new mongoose.Schema(
+  {
+    senderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "newUserModel",
+      required: true,
+    },
+    receiverId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "newUserModel",
+      required: true,
+    },
+    status: {
+      type: String,
+      enum: [
+        "Pending",
+        "Accepted",
+        "Reject",
+      ],
+      default: "Pending",
+    },
+  },
+  { timestamps: true }
+);
+
+let ConnectionRequestModel = mongoose.model("connectionRequestModel", connectionRequestSchema);
+
+
+
+
+
+// Send connection request
+router.post("/sendConnectionRequest", upload.none(), async (req, res) => {
+  try {
+    const { senderId, receiverId } = req.body;
+
+    // Check if already request exists
+    const existingRequest = await ConnectionRequestModel.findOne({ senderId, receiverId });
+    if (existingRequest) {
+      return res.status(400).json({ message: "Connection request already sent" });
+    }
+
+    const newRequest = new ConnectionRequestModel({ senderId, receiverId });
+    await newRequest.save();
+
+    res.status(200).json({ message: "Connection request sent successfully" });
+  } catch (error) {
+    console.error("Error sending connection request", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// Get received connection requests for a user
+router.post("/getReceivedRequests", upload.none(), async (req, res) => {
+  try {
+    const { receiverId } = req.body;
+
+    const receivedRequests = await ConnectionRequestModel.find({ receiverId, status: "Pending" }).populate('senderId');
+
+    res.status(200).json(receivedRequests);
+  } catch (error) {
+    console.error("Error fetching received connection requests", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// Accept a connection request
+
+
+router.post("/acceptConnectionRequest", upload.none(), async (req, res) => {
+  try {
+    const { requestId } = req.body;
+
+    // Find and accept the request
+    const request = await ConnectionRequestModel.findById(requestId);
+    if (!request) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    request.status = "Accepted";
+    await request.save();
+
+    // Remove any other pending request from receiver to sender (reverse request)
+    await ConnectionRequestModel.deleteMany({
+      senderId: request.receiverId,
+      receiverId: request.senderId,
+      status: "Pending",
+    });
+
+    res
+      .status(200)
+      .json({ message: "Connection request accepted successfully" });
+  } catch (error) {
+    console.error("Error accepting connection request", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+
+
+// Fetch sent requests for logged-in user
+
+router.post("/getSentRequests", upload.none(), async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    const sentRequests = await ConnectionRequestModel.find({
+      senderId: userId,
+      status: "Pending",
+      receiverId: { $exists: true, $ne: null }, // <-- ensure receiverId exists
+    });
+
+    res.status(200).json(sentRequests);
+  } catch (error) {
+    console.error("Error fetching sent connection requests", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// Reject Connection Request
+router.post("/rejectConnectionRequest", upload.none(), async (req, res) => {
+  try {
+    const { requestId } = req.body;
+
+    const request = await ConnectionRequestModel.findById(requestId);
+    if (!request) return res.status(404).json({ message: "Request not found" });
+
+    request.status = "Reject";
+    await request.save();
+
+    res.status(200).json({ message: "Request Rejected" });
+  } catch (error) {
+    console.error("Error rejecting connection request", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// Get My Connections (Accepted ones)
+router.post("/getMyConnections", upload.none(), async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    const connections = await ConnectionRequestModel.find({
+      $or: [{ senderId: userId }, { receiverId: userId }],
+      status: "Accepted",
+    }).populate(["senderId", "receiverId"]);
+
+    res.status(200).json(connections);
+  } catch (error) {
+    console.error("Error fetching connections", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+}); 
+// Fetch My Connections (Accepted ones) - Already implemented in your code
+
+
+// ---------------------Chat History ----------------//
+
+
+const messageSchema = new mongoose.Schema({
+  senderId: { type: mongoose.Schema.Types.ObjectId, ref: "newUserModel" },
+  receiverId: { type: mongoose.Schema.Types.ObjectId, ref: "newUserModel" },
+  message: String,
+  timestamp: { type: Date, default: Date.now },
+});
+
+let Message = mongoose.model("Message", messageSchema);
+
+
+
+
+// Get chat between two users
+router.post("/getChat", async (req, res) => {
+  const { user1, user2 } = req.body;
+  try {
+    const messages = await Message.find({
+      $or: [
+        { senderId: user1, receiverId: user2 },
+        { senderId: user2, receiverId: user1 },
+      ],
+    }).sort({ timestamp: 1 }); // chronological
+    res.json(messages);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to get chat" });
+  }
+});
+
+// Save message on send
+router.post("/send", async (req, res) => {
+  const { senderId, receiverId, message } = req.body;
+  try {
+    const newMsg = new Message({ senderId, receiverId, message });
+    await newMsg.save();
+    res.status(200).json(newMsg);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+
+
+
+
+
+
 
 module.exports = router;
